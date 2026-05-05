@@ -1162,7 +1162,6 @@ class Block(nn.Module):
         backend: str = "transformer_engine",
         image_context_dim: Optional[int] = None,
         use_wan_fp32_strategy: bool = False,
-        memory_context_dim: Optional[int] = None,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -1194,21 +1193,6 @@ class Block(nn.Module):
                 backend=backend,
             )
 
-        # Optional memory cross-attention (VPP IP-Adapter-style mem injection).
-        # Mirrors policy_models/module/memory_resampler.py:MemoryIPAttnProcessor:
-        # parallel K/V from compressed history tokens, gated additive skip into x.
-        self.memory_context_dim = memory_context_dim
-        if memory_context_dim is not None:
-            self.layer_norm_memory_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-            self.memory_cross_attn = Attention(
-                x_dim,
-                memory_context_dim,
-                num_heads,
-                x_dim // num_heads,
-                qkv_format="bshd",
-                backend=backend,
-            )
-
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
@@ -1229,20 +1213,10 @@ class Block(nn.Module):
                 nn.Linear(x_dim, adaln_lora_dim, bias=False),
                 nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
             )
-            if memory_context_dim is not None:
-                self.adaln_modulation_memory_attn = nn.Sequential(
-                    nn.SiLU(),
-                    nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                    nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
-                )
         else:
             self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
             self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
             self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-            if memory_context_dim is not None:
-                self.adaln_modulation_memory_attn = nn.Sequential(
-                    nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False)
-                )
 
         self.cp_size = None
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
@@ -1260,8 +1234,6 @@ class Block(nn.Module):
         self.layer_norm_self_attn.reset_parameters()
         self.layer_norm_cross_attn.reset_parameters()
         self.layer_norm_mlp.reset_parameters()
-        if self.memory_context_dim is not None:
-            self.layer_norm_memory_attn.reset_parameters()
 
         if self.use_adaln_lora:
             std = 1.0 / math.sqrt(self.x_dim)
@@ -1271,25 +1243,16 @@ class Block(nn.Module):
             torch.nn.init.zeros_(self.adaln_modulation_self_attn[2].weight)
             torch.nn.init.zeros_(self.adaln_modulation_cross_attn[2].weight)
             torch.nn.init.zeros_(self.adaln_modulation_mlp[2].weight)
-            if self.memory_context_dim is not None:
-                torch.nn.init.trunc_normal_(
-                    self.adaln_modulation_memory_attn[1].weight, std=std, a=-3 * std, b=3 * std
-                )
-                torch.nn.init.zeros_(self.adaln_modulation_memory_attn[2].weight)
         else:
             torch.nn.init.zeros_(self.adaln_modulation_self_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_cross_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_mlp[1].weight)
-            if self.memory_context_dim is not None:
-                torch.nn.init.zeros_(self.adaln_modulation_memory_attn[1].weight)
 
     def init_weights(self) -> None:
         self.reset_parameters()
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
         self.mlp.init_weights()
-        if self.memory_context_dim is not None:
-            self.memory_cross_attn.init_weights()
 
     def forward(
         self,
@@ -1300,7 +1263,6 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-        memory_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -1408,39 +1370,6 @@ class Block(nn.Module):
             gate_cross_attn_B_T_1_1_D,
         )
         x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
-
-        # Memory cross-attention (VPP IP-Adapter mem injection). Mirrors text cross-attn
-        # block structure with its own AdaLN modulation and gate. Init zero → no effect
-        # at start, lets training learn to use memory progressively.
-        if self.memory_context_dim is not None and memory_tokens is not None:
-            with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
-                if self.use_adaln_lora:
-                    shift_mem_attn_B_T_D, scale_mem_attn_B_T_D, gate_mem_attn_B_T_D = (
-                        self.adaln_modulation_memory_attn(emb_B_T_D) + adaln_lora_B_T_3D
-                    ).chunk(3, dim=-1)
-                else:
-                    shift_mem_attn_B_T_D, scale_mem_attn_B_T_D, gate_mem_attn_B_T_D = (
-                        self.adaln_modulation_memory_attn(emb_B_T_D).chunk(3, dim=-1)
-                    )
-            shift_mem_attn_B_T_1_1_D = rearrange(shift_mem_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-            scale_mem_attn_B_T_1_1_D = rearrange(scale_mem_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-            gate_mem_attn_B_T_1_1_D = rearrange(gate_mem_attn_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-
-            mem_normalized_x_B_T_H_W_D = _fn(
-                x_B_T_H_W_D, self.layer_norm_memory_attn, scale_mem_attn_B_T_1_1_D, shift_mem_attn_B_T_1_1_D,
-            )
-            mem_result_B_T_H_W_D = rearrange(
-                self.memory_cross_attn(
-                    rearrange(mem_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                    memory_tokens,
-                    rope_emb=rope_emb_L_1_1_D,
-                ),
-                "b (t h w) d -> b t h w d",
-                t=T,
-                h=H,
-                w=W,
-            )
-            x_B_T_H_W_D = x_B_T_H_W_D + gate_mem_attn_B_T_1_1_D * mem_result_B_T_H_W_D
 
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
@@ -1556,9 +1485,6 @@ class MiniTrainDIT(WeightTrainingStat):
         natten_parameters: Union[dict, list] = None,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
-        # VPP memory injection: if set, every block adds a memory cross-attention sublayer
-        # consuming external memory tokens (B, M, memory_context_dim) — see Block.forward.
-        memory_context_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1600,7 +1526,6 @@ class MiniTrainDIT(WeightTrainingStat):
         self.crossattn_proj_in_channels = crossattn_proj_in_channels
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
 
-        self.memory_context_dim = memory_context_dim
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1613,7 +1538,6 @@ class MiniTrainDIT(WeightTrainingStat):
                     backend=atten_backend,
                     image_context_dim=None if extra_image_context_dim is None else model_channels,
                     use_wan_fp32_strategy=use_wan_fp32_strategy,
-                    memory_context_dim=memory_context_dim,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1795,7 +1719,6 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
-        memory_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -1854,7 +1777,6 @@ class MiniTrainDIT(WeightTrainingStat):
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-                memory_tokens=memory_tokens,
             )
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
