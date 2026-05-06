@@ -539,7 +539,7 @@ class Video2WorldInference:
                 vid_input = read_and_process_image(
                     img_path=input_path,
                     resolution=video_resolution,
-                    num_video_frames=model_required_frames,
+                    num_video_frames=num_video_frames,
                     resize=True,
                 )
             elif ext in _VIDEO_EXTENSIONS:
@@ -547,7 +547,7 @@ class Video2WorldInference:
                 vid_input = read_and_process_video(
                     video_path=input_path,
                     resolution=video_resolution,
-                    num_video_frames=model_required_frames,
+                    num_video_frames=num_video_frames,
                     num_latent_conditional_frames=num_latent_conditional_frames,
                     resize=True,
                 )
@@ -861,7 +861,7 @@ class Video2WorldInference:
                 prompt=prompt,
                 input_path=chunk_input,
                 guidance=guidance,
-                num_video_frames=model_required_frames,
+                num_video_frames=num_video_frames,
                 num_latent_conditional_frames=chunk_latent_conditional,
                 resolution=resolution,
                 seed=seed + chunk_idx,
